@@ -132,6 +132,11 @@ static const char *op_text(int op)
     }
 }
 
+static int op_prio(int op)                           /* 运算符优先级 */
+{
+    return (op == 1 || op == 2) ? 1 : 2;
+}
+
 /* 按题意求值：返回 0 表示不合法（负数、除零、结果不是真分数） */
 static int eval_expr(const Expr *e, Frac *out)
 {
@@ -175,8 +180,8 @@ static Frac gen_atom(int range)
     }
 }
 
-/* 生成一棵合法表达式树；ops 为剩余可用的运算符个数 */
-static Expr *gen_expr(int ops, int range)
+/* 生成一棵合法表达式树；ops 为剩余可用的运算符个数，depth 用于控制括号深度 */
+static Expr *gen_expr(int ops, int range, int depth)
 {
     int i, op, left_ops;
 
@@ -190,7 +195,8 @@ static Expr *gen_expr(int ops, int range)
         op = rand_int(1, 4);
         left_ops = rand_int(0, ops - 1);
 
-        e = new_node(op, gen_expr(left_ops, range), gen_expr(ops - 1 - left_ops, range));
+        e = new_node(op, gen_expr(left_ops, range, depth + 1),
+                         gen_expr(ops - 1 - left_ops, range, depth + 1));
         if (eval_expr(e, &v)) return e;              /* 合法就采用 */
         free_expr(e);                                /* 否则换一个运算符重试 */
     }
@@ -198,55 +204,84 @@ static Expr *gen_expr(int ops, int range)
 }
 
 /*------------------------------ 题目输出 -----------------------------------*/
-/* 本版没有括号，按中序输出即为题面 */
-static void print_expr(const Expr *e)
+/* need_paren：这个子表达式作为父亲的操作数时是否需要写括号 */
+static int need_paren(const Expr *child, const Expr *parent, int is_right)
 {
+    if (child->op == 0)
+    {
+        /* 叶子一般不用括号；但如果这个叶子是分数，而父亲是 × 或 ÷，
+         * 就必须加括号，否则 "80 * 3/4 / 27" 会有歧义：
+         * 分不清 3/4 是一个分数还是 "80*3 ÷ 4"。 */
+        if (child->val.d != 1 && (parent->op == 3 || parent->op == 4)) return 1;
+        return 0;
+    }
+    if (op_prio(child->op) < op_prio(parent->op)) return 1;   /* 优先级低要加 */
+    if (op_prio(child->op) > op_prio(parent->op)) return 0;   /* 优先级高不加 */
+
+    /* 同优先级：- 和 / 的右操作数必须加括号，例如 8 / (4 / 2)、7 - (3 - 1) */
+    if (is_right && (parent->op == 2 || parent->op == 4)) return 1;
+    return 0;
+}
+
+static void print_expr(const Expr *e)                /* 输出题面，带必要的括号 */
+{
+    int lp, rp;
+
     if (e->op == 0) { put_frac(e->val); return; }
+
+    lp = need_paren(e->l, e, 0);
+    rp = need_paren(e->r, e, 1);
+
+    if (lp) put("( ");
     print_expr(e->l);
+    if (lp) put(" )");
+
     put(" ");
     put(op_text(e->op));
     put(" ");
+
+    if (rp) put("( ");
     print_expr(e->r);
+    if (rp) put(" )");
 }
 
 /*------------------------------ 表达式解析器 -------------------------------*/
-/* 递归下降解析题面，用来核对“题面读出来的答案”与“生成时的答案”是否一致。
- * 文法：e = t | e+t | e-t，t = a | t*a | t/a，a = 数 | 真分数 | 带分数 | (e) */
+/* 递归下降解析题目字符串，顺便按题意校验（负数、除零、除法结果必须为真分数） */
 static const char *g_s;                              /* 待解析的字符串 */
 
-static int pexpr_value(Frac *out);
-static Expr *pexpr_tree(void);                       /* 前置声明 */
-static Expr *pterm_tree(void);
-static Expr *patom_tree(void);
+static void skip_space(void) { while (*g_s == ' ') g_s++; }
 
-static int patom_value(Frac *out)
+static int parse_expr(Frac *out);
+
+static int parse_atom(Frac *out)                     /* 解析 数字 / 真分数 / 带分数 / ( e ) */
 {
-    long long whole = 0, num = 0, den = 0;
+    long long whole, num, den;
 
-    while (*g_s == ' ') g_s++;
+    skip_space();
     if (*g_s == '(')
     {
-        Frac v;
         g_s++;
-        if (!pexpr_value(&v)) return 0;
-        while (*g_s == ' ') g_s++;
+        if (!parse_expr(out)) return 0;
+        skip_space();
         if (*g_s != ')') return 0;
         g_s++;
-        *out = v;
         return 1;
     }
 
     if (*g_s < '0' || *g_s > '9') return 0;
+    whole = 0;
     while (*g_s >= '0' && *g_s <= '9') whole = whole * 10 + (*g_s++ - '0');
 
     if (*g_s == '\'')                                /* 带分数 n'a/b */
     {
         g_s++;
         if (*g_s < '0' || *g_s > '9') return 0;
+        num = 0;
         while (*g_s >= '0' && *g_s <= '9') num = num * 10 + (*g_s++ - '0');
         if (*g_s != '/') return 0;
         g_s++;
         if (*g_s < '0' || *g_s > '9') return 0;
+        den = 0;
         while (*g_s >= '0' && *g_s <= '9') den = den * 10 + (*g_s++ - '0');
         if (den == 0) return 0;
         *out = frac_make(whole * den + num, den);
@@ -257,75 +292,185 @@ static int patom_value(Frac *out)
     {
         g_s++;
         if (*g_s < '0' || *g_s > '9') return 0;
+        den = 0;
         while (*g_s >= '0' && *g_s <= '9') den = den * 10 + (*g_s++ - '0');
         if (den == 0) return 0;
         *out = frac_make(whole, den);
         return 1;
     }
 
-    *out = frac_make(whole, 1);
+    *out = frac_make(whole, 1);                      /* 自然数 */
     return 1;
 }
 
-static int pterm_value(Frac *out)
+static int parse_term(Frac *out)                     /* 只处理 × 和 ÷ */
 {
-    Frac a, b;
+    Frac left, right, r;
+    if (!parse_atom(&left)) return 0;
 
-    if (!patom_value(&a)) return 0;
     for (;;)
     {
-        char op;
-        while (*g_s == ' ') g_s++;
+        skip_space();
         if (*g_s != '*' && *g_s != '/') break;
-        op = *g_s++;
-        if (!patom_value(&b)) return 0;
-        if (op == '*') a = frac_mul(a, b);
-        else
         {
-            if (frac_is_zero(b)) return 0;
-            a = frac_div(a, b);
-            if (a.a >= a.d) return 0;                /* 商必须是真分数 */
+            char op = *g_s++;
+            if (!parse_atom(&right)) return 0;
+            if (op == '*') r = frac_mul(left, right);
+            else
+            {
+                if (frac_is_zero(right)) return 0;   /* 除数不能为 0 */
+                if (left.a * right.d >= right.a * left.d) return 0;  /* 必须是真分数 */
+                r = frac_div(left, right);
+            }
+            left = r;
         }
     }
-    *out = a;
+    *out = left;
     return 1;
 }
 
-static int pexpr_value(Frac *out)
+static int parse_expr(Frac *out)                     /* 处理 + 和 -（最低优先级） */
 {
-    Frac a, b;
+    Frac left, right, r;
+    if (!parse_term(&left)) return 0;
 
-    if (!pterm_value(&a)) return 0;
     for (;;)
     {
-        char op;
-        while (*g_s == ' ') g_s++;
+        skip_space();
         if (*g_s != '+' && *g_s != '-') break;
-        op = *g_s++;
-        if (!pterm_value(&b)) return 0;
-        if (op == '+') a = frac_add(a, b);
-        else
         {
-            if (a.a * b.d < b.a * a.d) return 0;     /* 不出现负数 */
-            a = frac_sub(a, b);
+            char op = *g_s++;
+            if (!parse_term(&right)) return 0;
+            if (op == '+') r = frac_add(left, right);
+            else
+            {
+                if (left.a * right.d < right.a * left.d) return 0;   /* 不出现负数 */
+                r = frac_sub(left, right);
+            }
+            left = r;
         }
     }
-    *out = a;
+    *out = left;
     return 1;
 }
 
-/* 解析整道题面并求值，成功返回 1 */
+/* 解析整道题面（不含尾部的 " ="）：成功返回 1 */
 static int parse_line(const char *s, Frac *out)
 {
     g_s = s;
-    if (!pexpr_value(out)) return 0;
-    while (*g_s == ' ') g_s++;
-    return (*g_s == '\0');
+    if (!parse_expr(out)) return 0;
+    skip_space();
+    return (*g_s == '\0');                           /* 必须整行正好解析完 */
+}
+
+/* 只按语法把题面还原成表达式树（不校验题意），失败返回 NULL。
+ * 用来比较“题面读出来的结构”和“生成时的结构”是否一致。 */
+static Expr *parse_expr_tree(void);
+
+static Expr *parse_atom_tree(void)
+{
+    Expr *e;
+    long long whole, num, den;
+    Frac v;
+
+    skip_space();
+    if (*g_s == '(')
+    {
+        g_s++;
+        e = parse_expr_tree();
+        if (e == NULL) return NULL;
+        skip_space();
+        if (*g_s != ')') { free_expr(e); return NULL; }
+        g_s++;
+        return e;
+    }
+
+    if (*g_s < '0' || *g_s > '9') return NULL;
+    whole = 0;
+    while (*g_s >= '0' && *g_s <= '9') whole = whole * 10 + (*g_s++ - '0');
+    if (*g_s == '\'')
+    {
+        g_s++;
+        if (*g_s < '0' || *g_s > '9') return NULL;
+        num = 0;
+        while (*g_s >= '0' && *g_s <= '9') num = num * 10 + (*g_s++ - '0');
+        if (*g_s != '/') return NULL;
+        g_s++;
+        if (*g_s < '0' || *g_s > '9') return NULL;
+        den = 0;
+        while (*g_s >= '0' && *g_s <= '9') den = den * 10 + (*g_s++ - '0');
+        if (den == 0) return NULL;
+        v = frac_make(whole * den + num, den);
+    }
+    else if (*g_s == '/')
+    {
+        g_s++;
+        if (*g_s < '0' || *g_s > '9') return NULL;
+        den = 0;
+        while (*g_s >= '0' && *g_s <= '9') den = den * 10 + (*g_s++ - '0');
+        if (den == 0) return NULL;
+        v = frac_make(whole, den);
+    }
+    else
+        v = frac_make(whole, 1);
+    return new_leaf(v);
+}
+
+static Expr *parse_term_tree(void)
+{
+    Expr *left = parse_atom_tree();
+
+    if (left == NULL) return NULL;
+    for (;;)
+    {
+        char op;
+        skip_space();
+        if (*g_s != '*' && *g_s != '/') break;
+        op = *g_s++;
+        {
+            Expr *right = parse_atom_tree();
+            if (right == NULL) { free_expr(left); return NULL; }
+            left = new_node((op == '*') ? 3 : 4, left, right);
+        }
+    }
+    return left;
+}
+
+static Expr *parse_expr_tree(void)
+{
+    Expr *left = parse_term_tree();
+
+    if (left == NULL) return NULL;
+    for (;;)
+    {
+        char op;
+        skip_space();
+        if (*g_s != '+' && *g_s != '-') break;
+        op = *g_s++;
+        {
+            Expr *right = parse_term_tree();
+            if (right == NULL) { free_expr(left); return NULL; }
+            left = new_node((op == '+') ? 1 : 2, left, right);
+        }
+    }
+    return left;
+}
+
+static Expr *parse_to_tree(const char *s)
+{
+    Expr *e;
+
+    g_s = s;
+    e = parse_expr_tree();
+    if (e == NULL) return NULL;
+    skip_space();
+    if (*g_s != '\0') { free_expr(e); return NULL; }
+    return e;
 }
 
 /*------------------------------ 规范形式与去重 -----------------------------*/
-/* 把表达式写成一个“规范字符串”：同运算符的 + / * 子表达式先展开、
- * 再把各操作数的规范字符串排序拼接，从而忽略交换律与结合律带来的差别。 */
+/* 规范字符串：+ 和 * 的操作数展开后排序（交换律、结合律），
+ * 括号被完整保留，所以 (3+4)*5 与 3+4*5 不会被误判为重复。 */
 static int cmp_str(const void *a, const void *b)
 {
     return strcmp(*(const char *const *)a, *(const char *const *)b);
@@ -333,21 +478,17 @@ static int cmp_str(const void *a, const void *b)
 
 static void canon_to(const Expr *e, char *buf, int size)
 {
-    char sub[8][1024];
+    char sub[8][2048];
     const char *p[8];
     int n = 0, i;
-    char nb[64];
 
     if (e->op == 0)                                  /* 叶子：直接用数值 */
     {
-        frac_text(e->val, nb, sizeof(nb));
-        strncpy(buf, nb, size - 1);
-        buf[size - 1] = '\0';
+        frac_text(e->val, buf, 64);
         return;
     }
 
-    /* 展开：把同运算符的操作数全部收集起来（结合律） */
-    if (e->op == 1 || e->op == 3)
+    if (e->op == 1 || e->op == 3)                    /* + 和 * ：展开后排序 */
     {
         const Expr *stack[8];
         int top = 0;
@@ -357,7 +498,7 @@ static void canon_to(const Expr *e, char *buf, int size)
             const Expr *cur = stack[--top];
             if (cur->op == e->op && n + top + 2 <= 8)
             {
-                stack[top++] = cur->r;               /* 展开成操作数列表 */
+                stack[top++] = cur->r;
                 stack[top++] = cur->l;
             }
             else
@@ -366,17 +507,17 @@ static void canon_to(const Expr *e, char *buf, int size)
                 n++;
             }
         }
+        for (i = 0; i < n; i++) p[i] = sub[i];
+        qsort(p, n, sizeof(p[0]), cmp_str);
     }
-    else                                             /* - 和 / 不满足交换律： */
-    {                                                /* 左、右子表达式各自递归即可 */
+    else                                             /* - 和 / ：保持左右顺序 */
+    {
         canon_to(e->l, sub[0], sizeof(sub[0]));
         canon_to(e->r, sub[1], sizeof(sub[1]));
+        p[0] = sub[0];
+        p[1] = sub[1];
         n = 2;
     }
-
-    for (i = 0; i < n; i++) p[i] = sub[i];
-    if (e->op == 1 || e->op == 3)                    /* 满足交换律，排序 */
-        qsort(p, n, sizeof(p[0]), cmp_str);
 
     g_p = buf;  g_end = buf + size - 1;  *g_p = '\0';
     put("(");
@@ -388,8 +529,22 @@ static void canon_to(const Expr *e, char *buf, int size)
     put(")");
 }
 
-/* 哈希表：保存已经出现过的题目的规范形式 */
-typedef struct HashNode
+/* 判断表达式树与它的题面文本是否完全一致（用来发现打印歧义） */
+static int canon_equal(const Expr *e, const char *text)
+{
+    Expr *back = parse_to_tree(text);
+    char k1[2048], k2[2048];
+    int same;
+
+    if (back == NULL) return 0;
+    canon_to(e, k1, sizeof(k1));
+    canon_to(back, k2, sizeof(k2));
+    same = (strcmp(k1, k2) == 0);
+    free_expr(back);
+    return same;
+}
+
+/* 哈希表：保存已经出现过的题目的规范形式 */typedef struct HashNode
 {
     char *key;
     struct HashNode *next;
@@ -404,7 +559,7 @@ static unsigned int hash_str(const char *s)
     return h % HASH_SIZE;
 }
 
-/* 返回 1 表示新题目（已插入），0 表示重复 */
+/* 返回 1 表示新题目（已插入），0 表示重复（重复的不会再插入） */
 static int hash_add_unique(const char *key)
 {
     unsigned int h = hash_str(key);
@@ -421,149 +576,60 @@ static int hash_add_unique(const char *key)
     return 1;
 }
 
-/* 把题面文本按同样的文法重新读成一棵树（只认语法，不校验题意），
- * 用来检查“题面”和“生成时的树”是不是同一个式子。 */
-static Expr *patom_tree(void)
+/* 生成一道新题目：保证不重复，且“题面解析出来的答案”等于“树求值答案” */
+static Expr *gen_unique(int range, Frac *ans, int *dup_try)
 {
-    long long whole = 0, num = 0, den = 0;
-    Frac v;
+    int guard = 0;
+    *dup_try = 0;
 
-    while (*g_s == ' ') g_s++;
-    if (*g_s == '(')
-    {
-        Expr *e;
-        g_s++;
-        e = pexpr_tree();
-        if (e == NULL) return NULL;
-        while (*g_s == ' ') g_s++;
-        if (*g_s != ')') { free_expr(e); return NULL; }
-        g_s++;
-        return e;
-    }
-
-    if (*g_s < '0' || *g_s > '9') return NULL;
-    while (*g_s >= '0' && *g_s <= '9') whole = whole * 10 + (*g_s++ - '0');
-    if (*g_s == '\'')
-    {
-        g_s++;
-        while (*g_s >= '0' && *g_s <= '9') num = num * 10 + (*g_s++ - '0');
-        if (*g_s != '/') return NULL;
-        g_s++;
-        while (*g_s >= '0' && *g_s <= '9') den = den * 10 + (*g_s++ - '0');
-        if (den == 0) return NULL;
-        v = frac_make(whole * den + num, den);
-    }
-    else if (*g_s == '/')
-    {
-        g_s++;
-        while (*g_s >= '0' && *g_s <= '9') den = den * 10 + (*g_s++ - '0');
-        if (den == 0) return NULL;
-        v = frac_make(whole, den);
-    }
-    else
-        v = frac_make(whole, 1);
-    return new_leaf(v);
-}
-
-static Expr *pterm_tree(void)
-{
-    Expr *left = patom_tree();
-
-    if (left == NULL) return NULL;
     for (;;)
     {
-        char op;
-        while (*g_s == ' ') g_s++;
-        if (*g_s != '*' && *g_s != '/') break;
-        op = *g_s++;
+        Expr *e = gen_expr(rand_int(1, MAX_OPS), range, 0);
+        char key[2048];
+        char text[MAX_LINE];
+        Frac by_parse;
+
+        if (!eval_expr(e, ans)) { free_expr(e); continue; }
+
+        canon_to(e, key, sizeof(key));
+        if (!hash_add_unique(key))                       /* 与已有题目重复 */
         {
-            Expr *right = patom_tree();
-            if (right == NULL) { free_expr(left); return NULL; }
-            left = new_node((op == '*') ? 3 : 4, left, right);
+            (*dup_try)++;
+            if (guard++ < 1000)                          /* 再抽一道 */
+            {
+                free_expr(e);
+                continue;
+            }
+            /* 抽样太多次都重复时接受它，保证程序一定能结束 */
         }
+
+        /* 自检一：把题面重新解析一遍，答案必须一致；
+         * 自检二：题面解析出来的结构必须和原来一样（否则题面有歧义） */
+        put_begin(text, MAX_LINE);
+        print_expr(e);
+        if (parse_line(text, &by_parse) &&
+            by_parse.a == ans->a && by_parse.d == ans->d &&
+            canon_equal(e, text))
+            return e;
+
+        free_expr(e);                                    /* 自检失败，重来 */
+        if (guard++ > 2000) return NULL;
     }
-    return left;
 }
 
-static Expr *pexpr_tree(void)
-{
-    Expr *left = pterm_tree();
-
-    if (left == NULL) return NULL;
-    for (;;)
-    {
-        char op;
-        while (*g_s == ' ') g_s++;
-        if (*g_s != '+' && *g_s != '-') break;
-        op = *g_s++;
-        {
-            Expr *right = pterm_tree();
-            if (right == NULL) { free_expr(left); return NULL; }
-            left = new_node((op == '+') ? 1 : 2, left, right);
-        }
-    }
-    return left;
-}
-
-/* 判断题面文本与表达式树是否“完全一致”（用来排除有歧义的题面） */
-static int canon_consistent(const Expr *e, const char *text)
-{
-    char k1[2048], k2[2048];
-    Expr *back;
-    int same;
-
-    g_s = text;
-    back = pexpr_tree();
-    if (back == NULL) return 0;
-    while (*g_s == ' ') g_s++;
-    if (*g_s != '\0') { free_expr(back); return 0; }
-
-    canon_to(e, k1, sizeof(k1));
-    canon_to(back, k2, sizeof(k2));
-    same = (strcmp(k1, k2) == 0);
-    free_expr(back);
-    return same;
-}
-
-/* 生成第 idx 道题：题目不重复，且题面解析出来的答案与树求值答案一致 */
-static void make_one(FILE *fe, FILE *fa, int range, int idx)
+/* 写出一道题目及其答案 */
+static void make_one(FILE *fe, FILE *fa, int range, int idx, int *dup_total)
 {
     Expr *e;
     Frac ans;
     char line[MAX_LINE];
     char ansline[MAX_LINE];
     char num[64];
-    char key[1024];
-    int guard = 0;
+    int dup_try = 0;
 
-    for (;;)
-    {
-        Frac back;
-        e = gen_expr(rand_int(1, MAX_OPS), range);
-        if (!eval_expr(e, &ans)) { free_expr(e); continue; }
-
-        canon_to(e, key, sizeof(key));
-        if (!hash_add_unique(key))                   /* 与已有题目重复 */
-        {
-            free_expr(e);
-            if (guard++ < 1000) continue;
-        }
-
-        /* 自检一：题面读回来的答案必须一致；自检二：题面不能有歧义 */
-        put_begin(line, MAX_LINE);
-        print_expr(e);
-        if (parse_line(line, &back) && back.a == ans.a && back.d == ans.d &&
-            canon_consistent(e, line))
-            break;
-
-        free_expr(e);
-        if (guard++ > 2000)                        /* 极端情况兜底 */
-        {
-            e = gen_expr(1, range);
-            eval_expr(e, &ans);
-            break;
-        }
-    }
+    e = gen_unique(range, &ans, &dup_try);
+    *dup_total += dup_try;
+    if (e == NULL) return;
 
     put_begin(line, MAX_LINE);
     put("题目");
@@ -600,7 +666,9 @@ static void usage(const char *exe)
 int main(int argc, char *argv[])
 {
     int n = 10, r = 0, i;
+    int dup_total = 0;
     FILE *fe, *fa;
+    clock_t t0, t1;
 
     srand((unsigned)time(NULL));
 
@@ -628,11 +696,15 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    t0 = clock();
     for (i = 1; i <= n; i++)
-        make_one(fe, fa, r, i);
+        make_one(fe, fa, r, i, &dup_total);
+    t1 = clock();
 
     fclose(fe);
     fclose(fa);
-    printf("已生成 %d 道题目（保证不重复）：Exercises.txt / Answers.txt\n", n);
+    printf("已生成 %d 道题目：Exercises.txt / Answers.txt\n", i - 1);
+    printf("去重丢弃的重复题目：%d 道；耗时 %.3f 秒\n",
+           dup_total, (double)(t1 - t0) / CLOCKS_PER_SEC);
     return 0;
 }
